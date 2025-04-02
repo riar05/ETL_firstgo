@@ -1,0 +1,482 @@
+"""
+data_quality_framework
+
+A comprehensive framework for data quality assessment and monitoring
+with configurable rules and reporting capabilities.
+"""
+
+import pandas as pd
+import numpy as np
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Callable, Any, Optional, Union, Tuple
+from datetime import datetime
+import logging
+from pathlib import Path
+
+
+class DataProfiler:
+    """Creates statistical profiles of datasets"""
+    
+    def __init__(self, df: pd.DataFrame, name: str = "dataset"):
+        self.df = df
+        self.name = name
+        self.profile = {}
+        
+    def generate_profile(self) -> Dict:
+        """Generate comprehensive statistical profile of the dataset"""
+        profile = {
+            "name": self.name,
+            "timestamp": datetime.now().isoformat(),
+            "rows": len(self.df),
+            "columns": len(self.df.columns),
+            "column_types": self._get_column_types(),
+            "missing_values": self._get_missing_values(),
+            "numeric_stats": self._get_numeric_stats(),
+            "categorical_stats": self._get_categorical_stats(),
+            "correlation": self._get_correlation()
+        }
+        
+        self.profile = profile
+        return profile
+    
+    def _get_column_types(self) -> Dict:
+        """Get data types of all columns"""
+        types = {}
+        for col in self.df.columns:
+            dtype = self.df[col].dtype
+            if pd.api.types.is_numeric_dtype(dtype):
+                if pd.api.types.is_integer_dtype(dtype):
+                    types[col] = "integer"
+                else:
+                    types[col] = "float"
+            elif pd.api.types.is_datetime64_dtype(dtype):
+                types[col] = "datetime"
+            elif pd.api.types.is_categorical_dtype(dtype):
+                types[col] = "categorical"
+            else:
+                types[col] = "string"
+        return types
+    
+    def _get_missing_values(self) -> Dict:
+        """Get missing value counts and percentages"""
+        missing = {}
+        for col in self.df.columns:
+            null_count = self.df[col].isnull().sum()
+            if null_count > 0:
+                missing[col] = {
+                    "count": int(null_count),
+                    "percentage": float(null_count / len(self.df) * 100)
+                }
+        return missing
+    
+    def _get_numeric_stats(self) -> Dict:
+        """Get statistics for numeric columns"""
+        stats = {}
+        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
+        
+        for col in numeric_cols:
+            col_stats = {
+                "min": float(self.df[col].min()),
+                "max": float(self.df[col].max()),
+                "mean": float(self.df[col].mean()),
+                "median": float(self.df[col].median()),
+                "std": float(self.df[col].std()),
+                "q1": float(self.df[col].quantile(0.25)),
+                "q3": float(self.df[col].quantile(0.75)),
+                "iqr": float(self.df[col].quantile(0.75) - self.df[col].quantile(0.25)),
+                "zeros": int((self.df[col] == 0).sum()),
+                "zeros_percentage": float((self.df[col] == 0).sum() / len(self.df) * 100)
+            }
+            
+            # Calculate outliers using IQR method
+            q1 = col_stats["q1"]
+            q3 = col_stats["q3"]
+            iqr = col_stats["iqr"]
+            lower_bound = q1 - (1.5 * iqr)
+            upper_bound = q3 + (1.5 * iqr)
+            
+            outliers = ((self.df[col] < lower_bound) | (self.df[col] > upper_bound)).sum()
+            col_stats["outliers"] = int(outliers)
+            col_stats["outliers_percentage"] = float(outliers / len(self.df) * 100)
+            
+            stats[col] = col_stats
+            
+        return stats
+    
+    def _get_categorical_stats(self) -> Dict:
+        """Get statistics for categorical and string columns"""
+        stats = {}
+        cat_cols = self.df.select_dtypes(exclude=[np.number, 'datetime64']).columns
+        
+        for col in cat_cols:
+            value_counts = self.df[col].value_counts().to_dict()
+            
+            # Convert counts to strings to ensure JSON serialization
+            value_counts = {str(k): int(v) for k, v in value_counts.items()}
+            
+            col_stats = {
+                "unique_values": int(self.df[col].nunique()),
+                "top_values": dict(sorted(value_counts.items(), key=lambda x: x[1], reverse=True)[:10]),
+                "empty_strings": int((self.df[col] == "").sum()) if self.df[col].dtype == object else 0
+            }
+            
+            stats[col] = col_stats
+            
+        return stats
+    
+    def _get_correlation(self) -> Dict:
+        """Get correlation matrix for numeric columns"""
+        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
+        
+        if len(numeric_cols) > 1:
+            corr_matrix = self.df[numeric_cols].corr().round(3).to_dict()
+            
+            # Convert to format better suited for JSON
+            correlation = {}
+            for col1, values in corr_matrix.items():
+                correlation[col1] = {str(col2): float(val) for col2, val in values.items()}
+                
+            return correlation
+        else:
+            return {}
+    
+    def save_profile(self, output_path: Union[str, Path]) -> None:
+        """Save profile to JSON file"""
+        if not self.profile:
+            self.generate_profile()
+            
+        with open(output_path, 'w') as f:
+            json.dump(self.profile, f, indent=2)
+    
+    def plot_missing_values(self) -> plt.Figure:
+        """Plot missing values heatmap"""
+        plt.figure(figsize=(10, 6))
+        missing = self.df.isnull()
+        
+        if missing.sum().sum() > 0:  # Only if there are missing values
+            sns.heatmap(missing, cmap='viridis', cbar=False, yticklabels=False)
+            plt.title(f'Missing Value Pattern in {self.name}')
+            plt.xlabel('Columns')
+            plt.ylabel('Rows')
+        else:
+            plt.text(0.5, 0.5, 'No missing values', horizontalalignment='center',
+                    verticalalignment='center', fontsize=16)
+            plt.axis('off')
+            
+        return plt.gcf()
+        
+    def plot_distribution(self, column: str) -> plt.Figure:
+        """Plot distribution of a column"""
+        plt.figure(figsize=(10, 6))
+        
+        if column not in self.df.columns:
+            plt.text(0.5, 0.5, f'Column {column} not found', horizontalalignment='center',
+                    verticalalignment='center', fontsize=16)
+            plt.axis('off')
+            return plt.gcf()
+            
+        if pd.api.types.is_numeric_dtype(self.df[column]):
+            sns.histplot(self.df[column].dropna(), kde=True)
+            plt.title(f'Distribution of {column}')
+            plt.xlabel(column)
+            plt.ylabel('Count')
+        else:
+            # For categorical variables, show top 10 categories
+            top_cats = self.df[column].value_counts().nlargest(10)
+            sns.barplot(x=top_cats.index, y=top_cats.values)
+            plt.title(f'Top 10 Values for {column}')
+            plt.xlabel(column)
+            plt.ylabel('Count')
+            plt.xticks(rotation=45, ha='right')
+            
+        plt.tight_layout()
+        return plt.gcf()
+
+
+class DataQualityRule:
+    """Base class for data quality rules"""
+    
+    def __init__(self, name: str, description: str, columns: List[str] = None):
+        self.name = name
+        self.description = description
+        self.columns = columns or []
+        self.result = None
+        self.passed = None
+        self.message = ""
+        
+    def check(self, df: pd.DataFrame) -> bool:
+        """Implement in child classes"""
+        raise NotImplementedError
+    
+    def get_result(self) -> Dict:
+        """Get rule check result"""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "columns": self.columns,
+            "passed": self.passed,
+            "message": self.message,
+            "result": self.result
+        }
+
+
+class CompletionRule(DataQualityRule):
+    """Check for null values in specified columns"""
+    
+    def __init__(self, columns: List[str], threshold: float = 0):
+        """
+        Args:
+            columns: List of columns to check
+            threshold: Maximum allowed percentage of missing values (0-100)
+        """
+        super().__init__(
+            name="Completion Rule",
+            description=f"Check for null values in columns (threshold: {threshold}%)",
+            columns=columns
+        )
+        self.threshold = threshold
+        
+    def check(self, df: pd.DataFrame) -> bool:
+        missing = {}
+        missing_percentages = {}
+        
+        for col in self.columns:
+            if col not in df.columns:
+                self.passed = False
+                self.message = f"Column {col} not found in data"
+                self.result = {"missing_columns": [col]}
+                return False
+                
+            null_count = df[col].isnull().sum()
+            null_percentage = null_count / len(df) * 100
+            
+            if null_percentage > self.threshold:
+                missing[col] = int(null_count)
+                missing_percentages[col] = float(null_percentage)
+                
+        if missing:
+            self.passed = False
+            self.message = f"Found columns with missing values above threshold: {missing_percentages}"
+            self.result = {
+                "missing_counts": missing,
+                "missing_percentages": missing_percentages
+            }
+            return False
+        else:
+            self.passed = True
+            self.message = "All specified columns have missing values below threshold"
+            self.result = {
+                "missing_counts": {col: int(df[col].isnull().sum()) for col in self.columns},
+                "missing_percentages": {col: float(df[col].isnull().sum() / len(df) * 100) for col in self.columns}
+            }
+            return True
+
+
+class UniquenessRule(DataQualityRule):
+    """Check for uniqueness constraint on columns"""
+    
+    def __init__(self, columns: List[str], is_primary_key: bool = False):
+        """
+        Args:
+            columns: List of columns that together should form a unique constraint
+            is_primary_key: Whether this uniqueness rule is for a primary key
+        """
+        constraint_type = "primary key" if is_primary_key else "unique constraint"
+        super().__init__(
+            name=f"{constraint_type.title()} Rule",
+            description=f"Check {constraint_type} on columns: {', '.join(columns)}",
+            columns=columns
+        )
+        self.is_primary_key = is_primary_key
+        
+    def check(self, df: pd.DataFrame) -> bool:
+        # Check if columns exist
+        missing_cols = [col for col in self.columns if col not in df.columns]
+        if missing_cols:
+            self.passed = False
+            self.message = f"Columns not found: {', '.join(missing_cols)}"
+            self.result = {"missing_columns": missing_cols}
+            return False
+        
+        # Check uniqueness
+        total_rows = len(df)
+        unique_rows = df[self.columns].drop_duplicates().shape[0]
+        duplicate_rows = total_rows - unique_rows
+        
+        if duplicate_rows > 0:
+            duplicate_pct = (duplicate_rows / total_rows) * 100
+            self.passed = False
+            self.message = f"Found {duplicate_rows} duplicate rows ({duplicate_pct:.2f}%)"
+            
+            # Find example duplicates
+            value_counts = df[self.columns].value_counts()
+            duplicates = value_counts[value_counts > 1]
+            example_values = []
+            
+            for i, (values, count) in enumerate(duplicates.items()):
+                if i >= 3:  # Limit to 3 examples
+                    break
+                    
+                if isinstance(values, tuple):
+                    values_dict = dict(zip(self.columns, values))
+                else:
+                    values_dict = {self.columns[0]: values}
+                    
+                example_values.append({
+                    "values": values_dict,
+                    "occurrences": int(count)
+                })
+            
+            self.result = {
+                "total_rows": total_rows,
+                "unique_rows": unique_rows,
+                "duplicate_rows": duplicate_rows,
+                "duplicate_percentage": float(duplicate_pct),
+                "example_duplicates": example_values
+            }
+            return False
+        else:
+            self.passed = True
+            self.message = "All rows are unique for the specified columns"
+            self.result = {
+                "total_rows": total_rows,
+                "unique_rows": unique_rows,
+                "duplicate_rows": 0,
+                "duplicate_percentage": 0.0
+            }
+            return True
+
+
+class ValueRangeRule(DataQualityRule):
+    """Check if values in a column are within specified range"""
+    
+    def __init__(self, column: str, min_value: Optional[float] = None, 
+                 max_value: Optional[float] = None):
+        """
+        Args:
+            column: Column to check
+            min_value: Minimum allowed value (inclusive)
+            max_value: Maximum allowed value (inclusive)
+        """
+        range_desc = []
+        if min_value is not None:
+            range_desc.append(f">= {min_value}")
+        if max_value is not None:
+            range_desc.append(f"<= {max_value}")
+            
+        range_str = " and ".join(range_desc)
+        
+        super().__init__(
+            name="Value Range Rule",
+            description=f"Check if values in {column} are {range_str}",
+            columns=[column]
+        )
+        self.column = column
+        self.min_value = min_value
+        self.max_value = max_value
+        
+    def check(self, df: pd.DataFrame) -> bool:
+        # Check if column exists
+        if self.column not in df.columns:
+            self.passed = False
+            self.message = f"Column {self.column} not found"
+            self.result = {"missing_columns": [self.column]}
+            return False
+            
+        # Skip NaN values
+        values = df[self.column].dropna()
+        
+        violations = pd.Series(False, index=values.index)
+        violation_types = []
+        
+        if self.min_value is not None:
+            min_violations = values < self.min_value
+            violations = violations | min_violations
+            if min_violations.any():
+                violation_types.append("below_minimum")
+        
+        if self.max_value is not None:
+            max_violations = values > self.max_value
+            violations = violations | max_violations
+            if max_violations.any():
+                violation_types.append("above_maximum")
+        
+        violation_count = violations.sum()
+        
+        if violation_count > 0:
+            violation_pct = (violation_count / len(values)) * 100
+            self.passed = False
+            self.message = f"Found {violation_count} values outside allowed range ({violation_pct:.2f}%)"
+            
+            # Get statistics about violations
+            violation_values = values[violations]
+            
+            self.result = {
+                "total_values": len(values),
+                "violation_count": int(violation_count),
+                "violation_percentage": float(violation_pct),
+                "violation_types": violation_types,
+                "min_violation_value": float(violation_values.min()) if violation_count > 0 else None,
+                "max_violation_value": float(violation_values.max()) if violation_count > 0 else None,
+                "mean_violation_value": float(violation_values.mean()) if violation_count > 0 else None
+            }
+            return False
+        else:
+            self.passed = True
+            self.message = "All values are within the allowed range"
+            self.result = {
+                "total_values": len(values),
+                "violation_count": 0,
+                "violation_percentage": 0.0,
+                "value_min": float(values.min()) if not values.empty else None,
+                "value_max": float(values.max()) if not values.empty else None,
+                "value_mean": float(values.mean()) if not values.empty else None
+            }
+            return True
+
+
+class DataQualityAssessment:
+    """Run and report on multiple data quality rules"""
+    
+    def __init__(self, name: str = "Data Quality Assessment"):
+        self.name = name
+        self.rules = []
+        self.results = []
+        self.timestamp = None
+        self.logger = logging.getLogger(f"dq.{name}")
+        self.logger.setLevel(logging.INFO)
+        
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+    
+    def add_rule(self, rule: DataQualityRule) -> None:
+        """Add a rule to the assessment"""
+        self.rules.append(rule)
+        
+    def run(self, df: pd.DataFrame) -> Dict:
+        """Run all rules and collect results"""
+        self.timestamp = datetime.now()
+        self.results = []
+        
+        self.logger.info(f"Starting data quality assessment: {self.name}")
+        self.logger.info(f"Dataset shape: {df.shape}")
+        
+        passed_count = 0
+        
+        for rule in self.rules:
+            self.logger.info(f"Running rule: {rule.name}")
+            
+            try:
+                passed = rule.check(df)
+                if passed:
+                    passed_count += 1
+                    self.logger.info(f"Rule passed: {rule.name}")
+                else:
+                    self.logger.warning(f"Rule failed: {rule.name} - {rule.message}")
+                    
+                self.
