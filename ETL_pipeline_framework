@@ -1,0 +1,307 @@
+"""
+data_pipeline_framework
+
+A modular framework for building ETL pipelines with built-in data quality checks
+and comprehensive logging/monitoring.
+"""
+
+import pandas as pd
+import numpy as np
+import logging
+from typing import Dict, List, Callable, Any, Optional
+from datetime import datetime
+
+class DataQualityCheck:
+    """Base class for data quality checks"""
+    
+    def __init__(self, name: str, description: str):
+        self.name = name
+        self.description = description
+        self.passed = None
+        self.message = ""
+        
+    def check(self, data: pd.DataFrame) -> bool:
+        """Implement in child classes"""
+        raise NotImplementedError
+    
+    def get_result(self) -> Dict:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "passed": self.passed,
+            "message": self.message
+        }
+
+class CompletionCheck(DataQualityCheck):
+    """Check for null values in specified columns"""
+    
+    def __init__(self, columns: List[str]):
+        super().__init__(
+            name="Completion Check",
+            description=f"Checks for null values in columns: {', '.join(columns)}"
+        )
+        self.columns = columns
+        
+    def check(self, data: pd.DataFrame) -> bool:
+        missing = {}
+        for col in self.columns:
+            if col not in data.columns:
+                self.passed = False
+                self.message = f"Column {col} not found in data"
+                return False
+                
+            null_count = data[col].isnull().sum()
+            if null_count > 0:
+                missing[col] = null_count
+                
+        if missing:
+            self.passed = False
+            self.message = f"Found null values in columns: {missing}"
+            return False
+        else:
+            self.passed = True
+            self.message = "All specified columns are complete"
+            return True
+
+class OutlierCheck(DataQualityCheck):
+    """Check for outliers in specified columns using IQR method"""
+    
+    def __init__(self, columns: List[str], iqr_multiplier: float = 1.5):
+        super().__init__(
+            name="Outlier Check",
+            description=f"Checks for outliers in columns: {', '.join(columns)}"
+        )
+        self.columns = columns
+        self.iqr_multiplier = iqr_multiplier
+        
+    def check(self, data: pd.DataFrame) -> bool:
+        outliers = {}
+        
+        for col in self.columns:
+            if col not in data.columns:
+                self.passed = False
+                self.message = f"Column {col} not found in data"
+                return False
+                
+            if not np.issubdtype(data[col].dtype, np.number):
+                continue
+                
+            q1 = data[col].quantile(0.25)
+            q3 = data[col].quantile(0.75)
+            iqr = q3 - q1
+            
+            lower_bound = q1 - (self.iqr_multiplier * iqr)
+            upper_bound = q3 + (self.iqr_multiplier * iqr)
+            
+            outlier_count = ((data[col] < lower_bound) | (data[col] > upper_bound)).sum()
+            
+            if outlier_count > 0:
+                outliers[col] = outlier_count
+        
+        if outliers:
+            self.passed = False
+            self.message = f"Found outliers in columns: {outliers}"
+            return False
+        else:
+            self.passed = True
+            self.message = "No outliers detected in specified columns"
+            return True
+
+class Pipeline:
+    """ETL pipeline with data quality checks"""
+    
+    def __init__(self, name: str):
+        self.name = name
+        self.extract_steps = []
+        self.transform_steps = []
+        self.load_steps = []
+        self.quality_checks = []
+        self.logger = self._setup_logger()
+        
+    def _setup_logger(self):
+        logger = logging.getLogger(f"pipeline.{self.name}")
+        logger.setLevel(logging.INFO)
+        
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            
+        return logger
+        
+    def add_extract_step(self, name: str, func: Callable, **kwargs):
+        self.extract_steps.append({"name": name, "func": func, "kwargs": kwargs})
+        
+    def add_transform_step(self, name: str, func: Callable):
+        self.transform_steps.append({"name": name, "func": func})
+        
+    def add_load_step(self, name: str, func: Callable, **kwargs):
+        self.load_steps.append({"name": name, "func": func, "kwargs": kwargs})
+        
+    def add_quality_check(self, check: DataQualityCheck):
+        self.quality_checks.append(check)
+        
+    def run(self) -> Dict:
+        start_time = datetime.now()
+        self.logger.info(f"Starting pipeline: {self.name}")
+        
+        # Extract
+        data = None
+        for step in self.extract_steps:
+            self.logger.info(f"Running extract step: {step['name']}")
+            try:
+                data = step["func"](**step["kwargs"])
+                self.logger.info(f"Extract step completed: {step['name']}")
+            except Exception as e:
+                self.logger.error(f"Extract step failed: {step['name']} - {str(e)}")
+                return {"status": "failed", "step": step['name'], "phase": "extract", "error": str(e)}
+        
+        # Transform
+        for step in self.transform_steps:
+            self.logger.info(f"Running transform step: {step['name']}")
+            try:
+                data = step["func"](data)
+                self.logger.info(f"Transform step completed: {step['name']}")
+            except Exception as e:
+                self.logger.error(f"Transform step failed: {step['name']} - {str(e)}")
+                return {"status": "failed", "step": step['name'], "phase": "transform", "error": str(e)}
+        
+        # Quality checks
+        quality_results = []
+        all_checks_passed = True
+        
+        for check in self.quality_checks:
+            self.logger.info(f"Running quality check: {check.name}")
+            try:
+                check_passed = check.check(data)
+                quality_results.append(check.get_result())
+                
+                if not check_passed:
+                    all_checks_passed = False
+                    self.logger.warning(f"Quality check failed: {check.name} - {check.message}")
+                else:
+                    self.logger.info(f"Quality check passed: {check.name}")
+                    
+            except Exception as e:
+                self.logger.error(f"Quality check error: {check.name} - {str(e)}")
+                quality_results.append({
+                    "name": check.name,
+                    "description": check.description,
+                    "passed": False,
+                    "message": f"Error: {str(e)}"
+                })
+                all_checks_passed = False
+        
+        if not all_checks_passed:
+            self.logger.warning("Some quality checks failed. See results for details.")
+        
+        # Load (only if quality checks pass)
+        if all_checks_passed:
+            for step in self.load_steps:
+                self.logger.info(f"Running load step: {step['name']}")
+                try:
+                    step["func"](data, **step["kwargs"])
+                    self.logger.info(f"Load step completed: {step['name']}")
+                except Exception as e:
+                    self.logger.error(f"Load step failed: {step['name']} - {str(e)}")
+                    return {
+                        "status": "failed", 
+                        "step": step['name'], 
+                        "phase": "load", 
+                        "error": str(e),
+                        "quality_results": quality_results
+                    }
+        else:
+            self.logger.error("Load phase skipped due to failed quality checks")
+            return {
+                "status": "failed", 
+                "phase": "quality_check", 
+                "quality_results": quality_results
+            }
+        
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        self.logger.info(f"Pipeline completed successfully in {duration:.2f} seconds")
+        
+        return {
+            "status": "success",
+            "duration": duration,
+            "quality_results": quality_results
+        }
+
+
+# Example usage
+def example_usage():
+    # Define extract function
+    def extract_from_csv(file_path):
+        return pd.read_csv(file_path)
+    
+    # Define transform functions
+    def clean_missing_values(df):
+        return df.fillna(df.mean(numeric_only=True))
+    
+    def normalize_columns(df):
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            df[f"{col}_normalized"] = (df[col] - df[col].min()) / (df[col].max() - df[col].min())
+        return df
+    
+    # Define load function
+    def save_to_csv(df, output_path):
+        df.to_csv(output_path, index=False)
+    
+    # Create and configure pipeline
+    pipeline = Pipeline("Sample Data Processing")
+    
+    # Add extract step
+    pipeline.add_extract_step(
+        name="Extract CSV",
+        func=extract_from_csv,
+        file_path="sample_data.csv"
+    )
+    
+    # Add transform steps
+    pipeline.add_transform_step(
+        name="Clean Missing Values",
+        func=clean_missing_values
+    )
+    
+    pipeline.add_transform_step(
+        name="Normalize Columns",
+        func=normalize_columns
+    )
+    
+    # Add quality checks
+    pipeline.add_quality_check(
+        CompletionCheck(columns=["age", "height", "weight"])
+    )
+    
+    pipeline.add_quality_check(
+        OutlierCheck(columns=["age", "height", "weight"])
+    )
+    
+    # Add load step
+    pipeline.add_load_step(
+        name="Save Processed Data",
+        func=save_to_csv,
+        output_path="processed_data.csv"
+    )
+    
+    # Run the pipeline
+    result = pipeline.run()
+    print(f"Pipeline finished with status: {result['status']}")
+    
+    if result['status'] == 'success':
+        print(f"Pipeline completed in {result['duration']:.2f} seconds")
+    else:
+        print(f"Pipeline failed in phase: {result.get('phase', 'unknown')}")
+    
+    print("\nQuality check results:")
+    for check_result in result['quality_results']:
+        status = "✅" if check_result['passed'] else "❌"
+        print(f"{status} {check_result['name']}: {check_result['message']}")
+
+if __name__ == "__main__":
+    example_usage()
